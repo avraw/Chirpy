@@ -1,16 +1,32 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
+	"os"
 	"strings"
 	"sync/atomic"
+	"time"
+
+	"github.com/avraw/Chirpy/internal/database"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
 
 type apiConfig struct {
 	fileServerHits atomic.Int32
+	dbq            *database.Queries
+	platform       string
 }
 
 func (a *apiConfig) cfgApiConfig(next http.Handler) http.Handler {
@@ -35,13 +51,6 @@ func (a *apiConfig) metricsHandler(w http.ResponseWriter, r *http.Request) {
     <p>Chirpy has been visited %d times!</p>
   </body>
 </html>`, (int(a.fileServerHits.Load())))))
-}
-
-func (a *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
-	a.fileServerHits.Store(0)
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(200)
-	w.Write([]byte(strconv.Itoa(int(a.fileServerHits.Load()))))
 }
 
 func validateHandler(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +104,47 @@ func badWordReplacer(msg string) string {
 	return strings.Join(s, " ")
 }
 
+func (a *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
+
+	type request struct {
+		Email string `json:"email"`
+	}
+	req := request{}
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&req)
+	if err != nil {
+
+		respondWithError(w, 500, "Something went wrong")
+		return
+	}
+
+	user, err := a.dbq.CreateUser(r.Context(), req.Email)
+	if err != nil {
+
+		respondWithError(w, 500, fmt.Sprintf("Something went wrong : %s ", err))
+		return
+	}
+	var u User
+
+	u.ID = user.ID
+	u.CreatedAt = user.CreatedAt
+	u.Email = user.Email
+	u.UpdatedAt = user.UpdatedAt
+
+	respondWithJSON(w, 201, u)
+}
+func (a *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
+
+	if a.platform != "dev" {
+		respondWithError(w, 403, "Now Allowed")
+	}
+	err := a.dbq.DeleteUser(r.Context())
+	if err != nil {
+		respondWithError(w, 500, fmt.Sprintf("Error deleting all users : %s ", err))
+	}
+	respondWithJSON(w, 200, "")
+}
+
 //helper functions for validate request body
 
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
@@ -135,7 +185,21 @@ func respondWithError(w http.ResponseWriter, code int, msg string) {
 }
 
 func main() {
-	a := apiConfig{}
+	godotenv.Load()
+
+	dbURL := os.Getenv("DB_URL")
+	plat := os.Getenv("PLATFORM")
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		fmt.Printf("Error connecting to db: %s ", err)
+	}
+
+	dbQueries := database.New(db)
+
+	a := apiConfig{
+		dbq:      dbQueries,
+		platform: plat,
+	}
 	mux := http.NewServeMux()
 
 	dh := http.Dir(".")
@@ -150,6 +214,8 @@ func main() {
 	mux.HandleFunc("POST /admin/reset", a.resetHandler)
 
 	mux.HandleFunc("POST /api/validate_chirp", validateHandler)
+
+	mux.HandleFunc("POST /api/users", a.createUser)
 
 	s := http.Server{
 
